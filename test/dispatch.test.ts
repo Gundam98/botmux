@@ -690,56 +690,67 @@ describe('resolveReportRecipientForSession', () => {
   };
   const input = {
     session: current, sessions: [source, current], knownPeerBotOpenIds: new Set([reviewer]),
-    taskLineage: { id: 'task', taskRoot: '/task', chatId: 'oc_task', dispatchRootMessageId: 'om_dispatch' },
+    recipientRoot: 'om_dispatch',
   };
 
-  it('inherits the exact task dispatch creator', () => {
+  it('inherits the creator of the exact recipient root', () => {
     expect(resolveReportRecipientForSession(input)).toEqual({
-      openId: reviewer, source: 'task-lineage-chat-creator', sourceSessionId: 'chat',
+      openId: reviewer, source: 'recipient-root-chat-creator', sourceSessionId: 'chat',
     });
   });
 
-  it('inherits the task reviewer for a legacy thread without scope', () => {
+  it('inherits the source creator for a legacy thread without scope', () => {
     expect(resolveReportRecipientForSession({ ...input, session: { ...current, scope: undefined } }))
-      .toEqual({ openId: reviewer, source: 'task-lineage-chat-creator', sourceSessionId: 'chat' });
+      .toEqual({ openId: reviewer, source: 'recipient-root-chat-creator', sourceSessionId: 'chat' });
   });
 
   it('does not override a peer creator in the current thread', () => {
-    expect(resolveReportRecipientForSession({ ...input, session: { ...current, creatorOpenId: reviewer } }))
-      .toEqual({ openId: reviewer, source: 'session-creator' });
+    expect(resolveReportRecipientForSession({
+      ...input, session: { ...current, creatorOpenId: 'ou_current_peer' },
+      knownPeerBotOpenIds: new Set([reviewer, 'ou_current_peer']),
+    })).toEqual({ openId: 'ou_current_peer', source: 'session-creator' });
   });
 
   it.each([
-    { status: 'closed' }, { scope: 'thread' as const }, { larkAppId: 'cli_other' },
-    { chatId: 'oc_other' }, { rootMessageId: 'om_other_task' },
+    { status: 'closed' }, { scope: 'thread' as const }, { scope: undefined }, { larkAppId: 'cli_other' },
+    { chatId: 'oc_other' }, { rootMessageId: 'om_other' },
     { createdAt: current.createdAt }, { createdAt: '2026-08-08T00:00:00Z' },
-    { createdAt: 'invalid' }, { creatorOpenId: 'ou_human' },
-  ])('rejects an invalid source: %j', overrides => {
-    expect(resolveReportRecipientForSession({ ...input, sessions: [{ ...source, ...overrides }, current] }))
-      .toEqual({ openId: user, source: 'session-creator' });
+    { createdAt: 'invalid' }, { creatorOpenId: 'ou_human' }, { creatorOpenId: undefined },
+  ])('fails closed for an invalid explicit source: %j', overrides => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [{ ...source, ...overrides }, current] }))
+      .toThrow('--recipient-root');
   });
 
   it.each([
     { status: 'closed' }, { scope: 'chat' as const }, { sessionId: undefined },
     { larkAppId: undefined }, { chatId: undefined }, { createdAt: 'invalid' },
-  ])('rejects an invalid current session: %j', overrides => {
-    expect(resolveReportRecipientForSession({ ...input, session: { ...current, ...overrides } }))
+  ])('fails closed for an invalid current session: %j', overrides => {
+    expect(() => resolveReportRecipientForSession({ ...input, session: { ...current, ...overrides } }))
+      .toThrow('--recipient-root');
+  });
+
+  it('keeps the session creator when no recipient root is supplied', () => {
+    expect(resolveReportRecipientForSession({ ...input, recipientRoot: undefined }))
       .toEqual({ openId: user, source: 'session-creator' });
   });
 
-  it('does not infer task identity from shared session metadata', () => {
-    expect(resolveReportRecipientForSession({ ...input, taskLineage: undefined }))
-      .toEqual({ openId: user, source: 'session-creator' });
+  it.each(['', ' ', 'invalid', 'om_', `om_${'x'.repeat(129)}`, 'om_missing'])('fails closed for root %j', recipientRoot => {
+    expect(() => resolveReportRecipientForSession({ ...input, recipientRoot })).toThrow('--recipient-root');
   });
 
-  it('rejects a binding for another chat', () => {
-    expect(resolveReportRecipientForSession({ ...input, taskLineage: { ...input.taskLineage, chatId: 'oc_other' } }))
-      .toEqual({ openId: user, source: 'session-creator' });
+  it('requires sender-scoped peer evidence', () => {
+    expect(() => resolveReportRecipientForSession({ ...input, knownPeerBotOpenIds: new Set() }))
+      .toThrow('--recipient-root');
   });
 
   it.each([reviewer, 'ou_human'])('rejects structural ambiguity before verifying %s', creatorOpenId => {
-    expect(resolveReportRecipientForSession({ ...input, sessions: [source, { ...source, sessionId: 'other', creatorOpenId }, current] }))
-      .toEqual({ openId: user, source: 'session-creator' });
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [source, { ...source, sessionId: 'other', creatorOpenId }, current] }))
+      .toThrow('--recipient-root');
+  });
+
+  it('rejects a missing explicit source even when the current creator is a peer', () => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [current], session: { ...current, creatorOpenId: reviewer } }))
+      .toThrow('--recipient-root');
   });
 
   it.each([
@@ -748,7 +759,7 @@ describe('resolveReportRecipientForSession', () => {
     [{ quoteTargetSenderOpenId: ' quote ' }, { openId: 'quote', source: 'quote-sender' }],
     [{}, { source: 'none' }],
   ])('preserves the historical fallback: %j', (session, expected) => {
-    expect(resolveReportRecipientForSession({ ...input, session })).toEqual(expected);
+    expect(resolveReportRecipientForSession({ ...input, recipientRoot: undefined, session })).toEqual(expected);
   });
 });
 

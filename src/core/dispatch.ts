@@ -15,7 +15,6 @@
  */
 
 import { resolveSendTarget, type SessionReplyTarget } from './reply-target.js';
-import type { ReportTaskLineage } from './report-task-lineage.js';
 
 export { resolveSendTarget };
 
@@ -433,7 +432,7 @@ export interface ReportRecipientSession {
 }
 
 export type ReportRecipientSource =
-  | 'task-lineage-chat-creator'
+  | 'recipient-root-chat-creator'
   | 'session-creator'
   | 'session-owner'
   | 'quote-sender'
@@ -449,23 +448,23 @@ export function resolveReportRecipientForSession(input: {
   session: ReportRecipientSession;
   sessions: ReportRecipientSession[];
   knownPeerBotOpenIds: ReadonlySet<string>;
-  taskLineage?: ReportTaskLineage;
+  recipientRoot?: string;
 }): ResolvedReportRecipient {
   const current = input.session;
   const currentCreator = current.creatorOpenId?.trim();
-  const currentCreatedAt = Date.parse(current.createdAt ?? '');
-  const taskLineage = input.taskLineage;
-  const canUseChatLineage = (current.scope ?? 'thread') === 'thread'
-    && current.status === 'active'
-    && !!current.sessionId
-    && !!current.larkAppId
-    && !!current.chatId
-    && Number.isFinite(currentCreatedAt)
-    && !!taskLineage
-    && taskLineage.chatId === current.chatId
-    && (!currentCreator || !input.knownPeerBotOpenIds.has(currentCreator));
-
-  if (canUseChatLineage) {
+  if (input.recipientRoot !== undefined) {
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(input.recipientRoot)) {
+      throw new Error('--recipient-root 必须是有效的 om_ 消息 id。');
+    }
+    const currentCreatedAt = Date.parse(current.createdAt ?? '');
+    if ((current.scope ?? 'thread') !== 'thread'
+      || current.status !== 'active'
+      || !current.sessionId
+      || !current.larkAppId
+      || !current.chatId
+      || !Number.isFinite(currentCreatedAt)) {
+      throw new Error('--recipient-root 需要有效的 active thread 来源会话。');
+    }
     // Count structural matches before checking peer identity so a peer+human ambiguity fails closed.
     const candidates = input.sessions.filter(candidate => {
       const candidateCreatedAt = Date.parse(candidate.createdAt ?? '');
@@ -474,20 +473,25 @@ export function resolveReportRecipientForSession(input: {
         && candidate.scope === 'chat'
         && candidate.larkAppId === current.larkAppId
         && candidate.chatId === current.chatId
-        && candidate.rootMessageId === taskLineage.dispatchRootMessageId
+        && candidate.rootMessageId === input.recipientRoot
         && Number.isFinite(candidateCreatedAt)
         && candidateCreatedAt < currentCreatedAt;
     });
-    if (candidates.length === 1) {
-      const candidateCreator = candidates[0].creatorOpenId?.trim();
-      if (candidateCreator && input.knownPeerBotOpenIds.has(candidateCreator)) {
-        return {
-          openId: candidateCreator,
-          source: 'task-lineage-chat-creator',
-          sourceSessionId: candidates[0].sessionId,
-        };
-      }
+    if (candidates.length !== 1) {
+      throw new Error('--recipient-root 未匹配唯一的同应用、同群且严格更早的 active chat 会话。');
     }
+    const candidateCreator = candidates[0].creatorOpenId?.trim();
+    if (!candidateCreator || !input.knownPeerBotOpenIds.has(candidateCreator)) {
+      throw new Error('--recipient-root 对应的 creator 不是当前应用已知的 peer。');
+    }
+    if (currentCreator && input.knownPeerBotOpenIds.has(currentCreator)) {
+      return { openId: currentCreator, source: 'session-creator' };
+    }
+    return {
+      openId: candidateCreator,
+      source: 'recipient-root-chat-creator',
+      sourceSessionId: candidates[0].sessionId,
+    };
   }
 
   if (currentCreator) return { openId: currentCreator, source: 'session-creator' };

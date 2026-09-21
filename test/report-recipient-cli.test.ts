@@ -24,7 +24,10 @@ afterEach(() => {
 
 async function runReport(options: {
   args?: string[];
-  binding?: 'missing' | 'null' | 'other-task' | 'other-chat';
+  recipientRoot?: string;
+  source?: Record<string, unknown>;
+  current?: Record<string, unknown>;
+  inlineContent?: boolean;
   peer?: 'missing' | 'other-app' | 'malformed' | 'global-only';
   ambiguous?: boolean;
   chatScope?: boolean;
@@ -42,16 +45,6 @@ async function runReport(options: {
   for (const dir of [home, data, context, relay]) mkdirSync(dir);
   const contentFile = join(context, 'review.txt');
   writeFileSync(contentFile, 'Ready for review');
-  if (options.binding !== 'missing') {
-    writeFileSync(join(context, 'botmux-task.json'), JSON.stringify(options.binding === 'null' ? null : {
-      schemaVersion: 1,
-      status: 'dispatched',
-      taskSlug: 'report-task',
-      taskRoot: root,
-      taskChatId: options.binding === 'other-chat' ? 'oc_other' : CHAT,
-      dispatch: { mode: 'chat', success: true, chatId: CHAT, messageId: options.binding === 'other-task' ? 'om_other_task' : SEED },
-    }));
-  }
   const source = {
     sessionId: 'source-chat', larkAppId: APP_ID, chatId: CHAT, rootMessageId: SEED,
     scope: 'chat', status: 'active', creatorOpenId: REVIEWER,
@@ -69,13 +62,13 @@ async function runReport(options: {
     } } } : {}),
   };
   seedPersistedSessionRows(data, APP_ID, {
-    [source.sessionId]: { ...source, replyTargets: current.replyTargets, currentReplyTarget: current.currentReplyTarget },
-    [current.sessionId]: current,
+    [source.sessionId]: { ...source, replyTargets: current.replyTargets, currentReplyTarget: current.currentReplyTarget, ...options.source },
+    [current.sessionId]: { ...current, ...options.current },
     ...(options.ambiguous ? { duplicate: { ...source, sessionId: 'duplicate', creatorOpenId: 'ou_other_human' } } : {}),
   });
   if (options.peer !== 'missing' && options.peer !== 'global-only') {
     writeFileSync(join(data, `bot-openids-${options.peer === 'other-app' ? 'cli_other' : APP_ID}.json`),
-      options.peer === 'malformed' ? 'null' : JSON.stringify({ Reviewer: REVIEWER }));
+      options.peer === 'malformed' ? 'null' : JSON.stringify({ Reviewer: REVIEWER, CurrentPeer: 'ou_current_peer' }));
   }
   if (options.peer === 'global-only') {
     writeFileSync(join(data, 'bots-info.json'), JSON.stringify([
@@ -114,7 +107,9 @@ async function runReport(options: {
     }
     process.argv = ['node', 'botmux', 'report', ...${JSON.stringify([
       '--session-id', options.chatScope ? source.sessionId : current.sessionId,
-      '--content-file', contentFile, ...(options.args ?? []),
+      ...(options.inlineContent ? ['Ready for review'] : ['--content-file', contentFile]),
+      ...(options.recipientRoot === undefined ? [] : ['--recipient-root', options.recipientRoot]),
+      ...(options.args ?? []),
     ])}];
     await import(${JSON.stringify(pathToFileURL(resolve('src/cli.ts')).href)});
   `;
@@ -157,13 +152,13 @@ function expectRecipient(result: Awaited<ReturnType<typeof runReport>>, openId: 
     .toEqual([{ tag: 'at', user_id: openId }]);
 }
 
-describe('report CLI task lineage and authenticated relay', () => {
+describe('report CLI recipient root and authenticated relay', () => {
   it('mentions the task reviewer while staying in the user-created thread after implicit relay miss', async () => {
-    const result = await runReport();
+    const result = await runReport({ recipientRoot: SEED });
     expectRecipient(result, REVIEWER);
     expect(result.outbound).toMatchObject({ method: 'reply', request: { path: { message_id: THREAD }, data: { reply_in_thread: true } } });
     expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
-    expect(result.output.recipient).toMatchObject({ source: 'task-lineage-chat-creator', sourceSessionId: 'source-chat' });
+    expect(result.output.recipient).toMatchObject({ source: 'recipient-root-chat-creator', sourceSessionId: 'source-chat' });
     expect(result.requests).toEqual([{ url: '/api/report-relay', body: {
       sessionId: 'current-thread', dispatchRoot: THREAD, content: 'Ready for review',
       originCapability: CAPABILITY, originTurnId: 'turn-report', originDispatchAttempt: 2,
@@ -171,31 +166,98 @@ describe('report CLI task lineage and authenticated relay', () => {
   });
 
   it('mentions the reviewer in a legacy thread whose persisted row omits scope', async () => {
-    const result = await runReport({ legacyThread: true });
+    const result = await runReport({ legacyThread: true, recipientRoot: SEED });
     expectRecipient(result, REVIEWER);
-    expect(result.output.recipient).toMatchObject({ source: 'task-lineage-chat-creator', sourceSessionId: 'source-chat' });
+    expect(result.output.recipient).toMatchObject({ source: 'recipient-root-chat-creator', sourceSessionId: 'source-chat' });
     expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
     expect(result.outbound).toMatchObject({ method: 'reply', request: { path: { message_id: THREAD }, data: { reply_in_thread: true } } });
   });
 
-  it.each(['missing', 'null', 'other-task', 'other-chat'] as const)('keeps the user for %s binding', async binding => {
-    expectRecipient(await runReport({ binding }), USER);
+  it('keeps the session creator without an explicit recipient root', async () => {
+    expectRecipient(await runReport(), USER);
+  });
+
+  it('accepts an equals-form recipient root and inline content', async () => {
+    const result = await runReport({ args: [`--recipient-root=${SEED}`], inlineContent: true });
+    expectRecipient(result, REVIEWER);
+    expect(result.requests[0].body.content).toBe('Ready for review');
+  });
+
+  it('preserves a current peer creator after validating the explicit source', async () => {
+    const result = await runReport({ recipientRoot: SEED, current: { creatorOpenId: 'ou_current_peer' } });
+    expectRecipient(result, 'ou_current_peer');
+    expect(result.output.recipient.source).toBe('session-creator');
+  });
+
+  it.each([
+    ['--recipient-root'], ['--recipient-root', '--top-level'], ['--recipient-root='],
+    ['--recipient-root', ' '], ['--recipient-root', '-'], ['--recipient-root', 'invalid'],
+    ['--recipient-root', 'om_'], [`--recipient-root=om_${'x'.repeat(129)}`],
+    ['--recipient-root', SEED, '--recipient-root=invalid'],
+    ['--recipient-root', SEED, '--recipient-root'],
+    ['--recipient-root', SEED, `--recipient-root=${SEED}`],
+  ])('rejects malformed recipient arguments before delivery: %j', async (...args) => {
+    const result = await runReport({ args });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--recipient-root');
+    expect(result.requests).toHaveLength(0);
+    expect(result.outbound).toBeUndefined();
   });
 
   it.each(['missing', 'other-app', 'malformed', 'global-only'] as const)('requires sender-scoped peer identity: %s', async peer => {
-    expectRecipient(await runReport({ peer }), USER);
+    const result = await runReport({ peer, recipientRoot: SEED });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--recipient-root');
+    expect(result.requests).toHaveLength(0);
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it.each([
+    { rootMessageId: 'om_other' }, { larkAppId: 'cli_other' }, { chatId: 'oc_other' },
+    { createdAt: '2026-08-07T07:45:00.000Z' }, { createdAt: '2026-08-08T00:00:00.000Z' },
+    { createdAt: 'invalid' }, { status: 'closed' }, { scope: 'thread' }, { scope: undefined },
+    { creatorOpenId: USER },
+  ])('rejects an invalid source before delivery: %j', async source => {
+    const result = await runReport({ source, recipientRoot: SEED });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--recipient-root');
+    expect(result.requests).toHaveLength(0);
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it.each([{ status: 'closed' }, { scope: 'chat' }])('rejects an invalid current session: %j', async current => {
+    const result = await runReport({ current, recipientRoot: SEED });
+    expect(result.status).toBe(1);
+    expect(result.requests).toHaveLength(0);
+    expect(result.outbound).toBeUndefined();
   });
 
   it('does not hide an ambiguous human source behind a verified peer', async () => {
-    expectRecipient(await runReport({ ambiguous: true }), USER);
+    const result = await runReport({ ambiguous: true, recipientRoot: SEED });
+    expect(result.status).toBe(1);
+    expect(result.requests).toHaveLength(0);
+    expect(result.outbound).toBeUndefined();
   });
+
+  it.each([
+    { args: [] }, { args: ['--top-level'] }, { args: ['--into', 'om_explicit'] },
+    { args: ['--legacy-dispatch'] }, { args: ['--dispatch-root', SEED] },
+  ])(
+    'does not downgrade an unmatched recipient root via placement or relay: %j', async ({ args }) => {
+      const result = await runReport({ args, recipientRoot: 'om_missing', relayStatus: 200, relayBody: { ok: true } });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('--recipient-root');
+      expect(result.requests).toHaveLength(0);
+      expect(result.outbound).toBeUndefined();
+    },
+  );
 
   it.each([
     ['explicit top level', ['--top-level'], 'plain'],
     ['explicit topic', ['--into', 'om_explicit'], 'thread'],
     ['legacy fallback', ['--legacy-dispatch'], 'plain'],
   ])('keeps recipient independent of %s placement', async (_label, args, mode) => {
-    const result = await runReport({ args: args as string[] });
+    const result = await runReport({ args: args as string[], recipientRoot: SEED });
     expectRecipient(result, REVIEWER);
     if (mode === 'plain') {
       expect(result.outbound).toMatchObject({ method: 'create', request: { data: { receive_id: CHAT } } });
@@ -218,7 +280,7 @@ describe('report CLI task lineage and authenticated relay', () => {
   });
 
   it('keeps thread-session placement anchored even with another live turn target', async () => {
-    const result = await runReport({ turnPlacement: 'thread' });
+    const result = await runReport({ turnPlacement: 'thread', recipientRoot: SEED });
     expectRecipient(result, REVIEWER);
     expect(result.output.placementSource).toBe('current-turn');
     expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
@@ -231,8 +293,18 @@ describe('report CLI task lineage and authenticated relay', () => {
     expect(result.requests).toHaveLength(0);
   });
 
+  it('keeps recipient root independent of an explicit relay root', async () => {
+    const result = await runReport({ recipientRoot: SEED, args: ['--dispatch-root', 'om_relay_seed'], relayStatus: 200, relayBody: {
+      ok: true, triggerId: 'trigger-report', reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+    } });
+    expect(result.status).toBe(0);
+    expect(result.requests[0].body.dispatchRoot).toBe('om_relay_seed');
+    expect(result.output.recipient.openId).toBe(REVIEWER);
+    expect(result.outbound).toBeUndefined();
+  });
+
   it('retains authenticated orchestrator relay without a Lark fallback', async () => {
-    const result = await runReport({ relayStatus: 200, relayBody: {
+    const result = await runReport({ recipientRoot: SEED, relayStatus: 200, relayBody: {
       ok: true, triggerId: 'trigger-report', reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
     } });
     if (result.status !== 0) console.error(result.stderr);
@@ -245,7 +317,7 @@ describe('report CLI task lineage and authenticated relay', () => {
     { relayStatus: 403, relayBody: { error: 'invalid_origin_capability' } },
     { relayStatus: 404, args: ['--dispatch-root', SEED] },
   ])('does not downgrade rejected or explicit relay requests: %j', async options => {
-    const result = await runReport(options);
+    const result = await runReport({ ...options, recipientRoot: SEED });
     expect(result.status).toBe(1);
     expect(result.outbound).toBeUndefined();
     expect(result.requests).toHaveLength(1);
